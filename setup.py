@@ -64,7 +64,6 @@ DOCS_DEPS = [
 
 BUILD_DEPS = [
     CYTHON_DEPENDENCY,
-    'setuptools-rust==0.10.6',
 ]
 
 EXTRA_DEPS = {
