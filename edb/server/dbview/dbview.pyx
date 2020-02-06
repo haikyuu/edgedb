@@ -20,13 +20,12 @@
 import json
 import os.path
 import pickle
-import time
 import typing
 
 import immutables
 
 from edb import errors
-from edb.common import lru
+from edb.common import lru, uuidgen
 from edb.server import defines, config
 from edb.server.compiler import dbstate
 from edb.pgsql import dbops
@@ -42,7 +41,7 @@ cdef class Database:
 
     def __init__(self, DatabaseIndex index, str name):
         self._name = name
-        self._dbver = time.monotonic_ns()
+        self._dbver = uuidgen.uuid1mc().bytes
 
         self._index = index
 
@@ -50,7 +49,7 @@ cdef class Database:
             maxsize=defines._MAX_QUERIES_CACHE)
 
     cdef _signal_ddl(self):
-        self._dbver = time.monotonic_ns()  # Advance the version
+        self._dbver = uuidgen.uuid1mc().bytes
         self._invalidate_caches()
 
     cdef _invalidate_caches(self):
@@ -60,7 +59,7 @@ cdef class Database:
         assert compiled.cacheable
 
         existing = self._eql_to_compiled.get(key)
-        if existing is not None and existing.dbver > compiled.dbver:
+        if existing is not None and existing.dbver == compiled.dbver:
             # We already have a cached query for a more recent DB version.
             return
 
@@ -104,6 +103,11 @@ cdef class DatabaseConnectionView:
         self._in_tx_with_set = False
         self._tx_error = False
         self._invalidate_local_cache()
+
+    cdef on_remote_ddl(self, bytes new_dbver):
+        """Called when a DDL operation was applied at another server."""
+        if new_dbver != self._db._dbver:
+            self._db._signal_ddl()
 
     cdef rollback_tx_to_savepoint(self, spid, modaliases, config):
         self._tx_error = False
@@ -219,6 +223,8 @@ cdef class DatabaseConnectionView:
         self.tx_error()
 
     cdef on_success(self, query_unit):
+        signal_ddl = False
+
         if query_unit.tx_savepoint_rollback:
             # Need to invalidate the cache in case there were
             # SET ALIAS or CONFIGURE or DDL commands.
@@ -226,6 +232,7 @@ cdef class DatabaseConnectionView:
 
         if not self._in_tx and query_unit.has_ddl:
             self._db._signal_ddl()
+            signal_ddl = True
 
         if query_unit.modaliases is not None:
             self._modaliases = query_unit.modaliases
@@ -239,6 +246,7 @@ cdef class DatabaseConnectionView:
             self._config = self._in_tx_config
             if self._in_tx_with_ddl:
                 self._db._signal_ddl()
+                signal_ddl = True
             self._reset_tx_state()
 
         elif query_unit.tx_rollback:
@@ -247,6 +255,8 @@ cdef class DatabaseConnectionView:
             # TODO: That said, we should send a *warning* when a ROLLBACK
             # is executed outside of a tx.
             self._reset_tx_state()
+
+        return signal_ddl
 
     async def apply_config_ops(self, conn, ops):
         for op in ops:
@@ -280,7 +290,6 @@ cdef class DatabaseIndex:
         self._sys_queries = None
         self._instance_data = None
         self._sys_config = None
-        self._sys_config_ver = time.monotonic_ns()
 
     async def get_sys_query(self, conn, key: str) -> bytes:
         if self._sys_queries is None:
@@ -365,8 +374,6 @@ cdef class DatabaseIndex:
         else:
             raise errors.UnsupportedFeatureError(
                 f'unsupported config operation: {op.opcode}')
-
-        self._sys_config_ver = time.monotonic_ns()
 
         if op.opcode is config.OpCode.CONFIG_ADD:
             await self._server._after_system_config_add(

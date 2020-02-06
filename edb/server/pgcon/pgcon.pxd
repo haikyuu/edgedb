@@ -82,6 +82,7 @@ cdef class PGProto:
         bint debug
 
         object pgaddr
+        object edgecon_ref
 
     cdef write(self, buf)
 

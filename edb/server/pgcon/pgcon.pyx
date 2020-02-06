@@ -22,6 +22,7 @@ import codecs
 import hashlib
 import json
 import os.path
+import weakref
 
 cimport cython
 cimport cpython
@@ -91,6 +92,7 @@ def _build_init_con_script() -> bytes:
             ('', {pg_ql(defines.DEFAULT_MODULE_ALIAS)}, 'A'),
             ('server_version', {pg_ql(buildmeta.get_version_json())}, 'R');
 
+        LISTEN __edgedb_ddl__;
     ''').encode('utf-8')
 
 
@@ -170,12 +172,16 @@ cdef class PGProto:
         self.debug = debug.flags.server_proto
 
         self.pgaddr = addr
+        self.edgecon_ref = None
 
     def debug_print(self, *args):
         print(
             '::PGPROTO::',
             *args,
         )
+
+    def set_edgecon(self, edgecon.EdgeConnection edgecon):
+        self.edgecon_ref = weakref.ref(edgecon)
 
     def get_pgaddr(self):
         return self.pgaddr
@@ -207,6 +213,12 @@ cdef class PGProto:
         if self.msg_waiter and not self.msg_waiter.done():
             self.msg_waiter.set_exception(ConnectionAbortedError())
             self.msg_waiter = None
+
+    async def signal_ddl(self, dbver):
+        query = f"""
+            SELECT pg_notify('__edgedb_ddl__', {pg_ql(dbver.hex())})
+        """.encode()
+        await self.simple_query(query, True)
 
     async def sync(self):
         if self.waiting_for_sync:
@@ -929,7 +941,18 @@ cdef class PGProto:
 
         elif mtype == b'A':
             # NotificationResponse
-            self.buffer.discard_message()
+            self.buffer.read_int32()  # discard pid
+            channel = self.buffer.read_null_str().decode()
+            payload = self.buffer.read_null_str().decode()
+            self.buffer.finish_message()
+
+            if channel == '__edgedb_ddl__':
+                dbver = bytes.fromhex(payload)
+                if self.edgecon_ref is not None:
+                    edgecon = self.edgecon_ref()
+                    if edgecon is not None:
+                        edgecon.on_remote_ddl(dbver)
+
             return True
 
         elif mtype == b'N':

@@ -1888,6 +1888,41 @@ class TestServerProto(tb.QueryTestCase):
                 result, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
 
+class TestServerProtoMigration(tb.QueryTestCase):
+
+    ISOLATED_METHODS = False
+
+    async def test_server_proto_mig_01(self):
+        # Replicating the "test_edgeql_tutorial" test that might
+        # disappear at some point. That test was the only one that
+        # uncovered a regression in how server schema state is
+        # handled, so we need to keep some form of it.
+
+        typename = f'test_{uuid.uuid4().hex}'
+
+        await self.con.execute(f'''
+            START TRANSACTION;
+            CREATE MIGRATION def TO {{
+                module default {{
+                    type {typename} {{
+                        required property foo -> str;
+                    }}
+                }}
+            }};
+            COMMIT MIGRATION def;
+            COMMIT;
+
+            INSERT {typename} {{
+                foo := '123'
+            }};
+        ''')
+
+        await self.assert_query_result(
+            f'SELECT {typename}.foo',
+            ['123']
+        )
+
+
 class TestServerProtoDDL(tb.NonIsolatedDDLTestCase):
 
     async def test_server_proto_query_cache_invalidate_01(self):
